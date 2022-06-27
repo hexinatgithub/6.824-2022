@@ -20,6 +20,8 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
+	"fmt"
 	"math/rand"
 	"sort"
 	"sync"
@@ -27,6 +29,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -93,14 +96,13 @@ func (l *Log) replace(start int, entries ...Entry) {
 	}
 
 	last := l.last()
-	i := 0
-	for start <= last.Index {
-		l.Entries[start] = entries[i]
-		start++
-		i++
-	}
-	for ; i < len(entries); i++ {
-		l.Entries = append(l.Entries, entries[i])
+	for i := 0; i < len(entries); i++ {
+		if start <= last.Index {
+			l.Entries[start] = entries[i]
+			start++
+		} else {
+			l.Entries = append(l.Entries, entries[i])
+		}
 	}
 }
 
@@ -134,21 +136,24 @@ func (l *Log) firstIndexWithSameTerm(back int) int {
 func (l *Log) lastIndexWithSameTerm(start int) int {
 	lastIndex := l.last().Index
 	i, j := start, start+1
-	for j <= lastIndex {
+	for i < lastIndex {
 		if l.get(i).Term != l.get(j).Term {
-			return i
+			break
 		}
 		i++
 		j++
 	}
-	return lastIndex
+	return i
 }
 
-var defaultEntry = &Entry{
-	Index: -1,
-	Term:  -1,
-}
-var empty *Entry = nil
+var (
+	None         = -1
+	defaultEntry = &Entry{
+		Index: None,
+		Term:  None,
+	}
+	empty *Entry = nil
+)
 
 func (l *Log) get(i int) *Entry {
 	if i == -1 {
@@ -200,13 +205,14 @@ type Raft struct {
 	vote int
 	log  Log
 
-	commitIndex int
-	lastApplied int
-	status      status
-	knock       time.Time
-	progress    *progress
-	applyCh     chan<- ApplyMsg
-	applyCond   *sync.Cond
+	commitIndex     int
+	lastApplied     int
+	status          status
+	knock           time.Time
+	electionTimeout *time.Ticker
+	progress        *progress
+	applyCh         chan<- ApplyMsg
+	applyCond       *sync.Cond
 }
 
 type progress struct {
@@ -267,6 +273,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.term)
+	e.Encode(rf.vote)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	Debug(dPersist, "%s save persistent state to stable storage", rf)
 }
 
 //
@@ -289,6 +303,13 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&rf.term) != nil ||
+		d.Decode(&rf.vote) != nil ||
+		d.Decode(&rf.log) != nil {
+		panic("readPersist")
+	}
 }
 
 //
@@ -357,24 +378,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	persist := false
+	defer func() {
+		if persist {
+			rf.persist()
+		}
+	}()
 
 	if args.Term < rf.term {
-		Debug(dDrop, "S%d %s RequestVote args's Term %d is old, current term is %d", rf.me, rf.status, args.Term, rf.term)
+		Debug(dDrop, "%s RequestVote args's Term %d is old, current term is %d", rf, args.Term, rf.term)
 		reply.Term = rf.term
 		reply.VoteGranted = false
 		return
-	}
-
-	if args.Term > rf.term {
-		Debug(dTerm, "S%d %s RequestVote args's Term %d is new, current term is %d, change to %d", rf.me, rf.status, args.Term, rf.term, args.Term)
+	} else if args.Term > rf.term {
+		Debug(dTerm, "%s RequestVote args's Term %d is new, current term is %d, change to %d", rf, args.Term, rf.term, args.Term)
 		rf.term = args.Term
 		rf.vote = -1
 		rf.becomeFollower()
+		persist = true
 	}
 
 	// repeat request vote, grant
 	if rf.vote == args.CandidateId {
-		Debug(dVote, "S%d %s, already vote for %d, grant vote", rf.me, rf.status, args.CandidateId, rf.vote)
+		Debug(dVote, "%s already vote for %d, grant vote", rf, args.CandidateId, rf.vote)
 		reply.Term = rf.term
 		reply.VoteGranted = true
 		return
@@ -382,64 +408,68 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// vote for other peer, just deny
 	if rf.vote != -1 {
-		Debug(dVote, "S%d %s, deny vote for %d, already vote for %d", rf.me, rf.status, args.CandidateId, rf.vote)
+		Debug(dVote, "%s deny vote for %d, already vote for %d", rf, args.CandidateId, rf.vote)
 		reply.Term = rf.term
 		reply.VoteGranted = false
 		return
 	}
 
 	if rf.log.moreUpToDate(args.LastLogIndex, args.LastLogTerm) {
-		Debug(dVote, "S%d %s log is more update, deny vote for %d", rf.me, rf.status, args.CandidateId)
+		Debug(dVote, "%s log is more update, deny vote for %d", rf, args.CandidateId)
 		reply.Term = rf.term
 		reply.VoteGranted = false
 		return
 	}
 
 	rf.vote = args.CandidateId
+	rf.knock = time.Now()
 	rf.becomeFollower()
+	persist = true
 	reply.Term = rf.term
 	reply.VoteGranted = true
-	Debug(dVote, "S%d %s grant vote for %d, become Follower", rf.me, rf.status, args.CandidateId)
+	Debug(dVote, "%s grant vote for %d, become Follower", rf, args.CandidateId)
 	return
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	persist := false
+	defer func() {
+		if persist {
+			rf.persist()
+		}
+	}()
 
 	if args.Term < rf.term {
 		reply.Term = rf.term
 		reply.Success = false
-		Debug(dDrop, "S%d %s, AppendEntries args's Term %d is old, current term is %d",
-			rf.me, rf.status, args.Term, rf.term)
+		Debug(dDrop, "%s AppendEntries args's Term %d is old, current term is %d, drop message", rf, args.Term, rf.term)
 		return
-	}
-
-	if args.Term > rf.term {
+	} else if args.Term > rf.term {
 		rf.term = args.Term
-		Debug(dTerm, "S%d %s, AppendEntries args's Term is new, current term is %d, change to %d, become Follower",
-			rf.me, rf.status, rf.term, args.Term)
+		persist = true
+		Debug(dTerm, "%s, AppendEntries args's Term is new, current term is %d, change to %d, become Follower", rf, rf.term, args.Term)
 	}
 
 	if rf.status != Follower {
-		Debug(dInfo, "S%d %s transfer to %s", rf.me, rf.status, Follower)
+		Debug(dInfo, "%s transfer to %s", rf, Follower)
 		rf.becomeFollower()
-	} else {
-		rf.knock = time.Now()
-		Debug(dInfo, "S%d %s receive AppendEntries", rf.me, rf.status)
 	}
+	rf.knock = time.Now()
+	Debug(dInfo, "%s receive AppendEntries", rf)
 
 	entry := rf.log.get(args.PrevLogIndex)
 	last := rf.log.last()
 
-	// follower log is longer
+	// follower log is short
 	if entry == nil {
 		reply.Term = rf.term
 		reply.Success = false
-		reply.XIndex = -1
-		reply.XTerm = -1
+		reply.XIndex = last.Index + 1
+		reply.XTerm = None
 		reply.XLen = last.Index + 1
-		Debug(dLog, "S%d %s doesn't contain an entry at %d", rf.me, rf.status, args.PrevLogIndex)
+		Debug(dLog, "%s doesn't contain an entry at %d", rf, args.PrevLogIndex)
 		return
 	}
 
@@ -447,22 +477,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if entry.Term != args.PrevLogTerm {
 		firstIndex := rf.log.firstIndexWithSameTerm(entry.Index)
 		rf.log.truncate(args.PrevLogIndex)
+		persist = true
 		reply.Term = rf.term
 		reply.Success = false
 		reply.XIndex = firstIndex
 		reply.XTerm = entry.Term
 		reply.XLen = args.PrevLogIndex
-		Debug(dLog, "S%d %s contain conflict entry at %d, truncate log", rf.me, rf.status, args.PrevLogIndex)
+		Debug(dLog, "%s contain conflict entry at %d, truncate log", rf, args.PrevLogIndex)
 		return
 	}
 
 	rf.log.replace(args.PrevLogIndex+1, args.Entries...)
-	last = rf.log.last()
-	Debug(dLog, "S%d %s append new %d log entries", rf.me, rf.status, len(args.Entries))
+	if len(args.Entries) != 0 {
+		Debug(dLog, "%s append new %d log entries", rf, len(args.Entries))
+		persist = true
+	}
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, last.Index)
+		rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 		rf.applyCond.Signal()
-		Debug(dCommit, "S%d %s update commitIndex to %d", rf.me, rf.status, rf.commitIndex)
+		Debug(dCommit, "%s update commitIndex to %d", rf, rf.commitIndex)
 	}
 
 	reply.Term = rf.term
@@ -533,7 +566,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 
 	if rf.status != Leader {
-		Debug(dDrop, "S%d %s is not Leader, drop command", rf.me, rf.status)
+		Debug(dDrop, "%s is not Leader, drop command", rf)
 		return index, term, false
 	}
 
@@ -542,7 +575,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 	term = rf.term
-	Debug(dInfo, "S%d %s append log at index %d, current term is %d", rf.me, rf.status, index, term)
+	Debug(dInfo, "%s append log at index %d, current term is %d", rf, index, term)
+	rf.persist()
 
 	rf.progress.nextIndex[rf.me] = index + 1
 	rf.progress.matchIndex[rf.me] = index
@@ -571,7 +605,14 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-const heartBeatInterval = 100 * time.Millisecond
+const (
+	heartBeatInterval = 100 * time.Millisecond
+	interval          = 25 * time.Millisecond
+)
+
+func randElectionTimeout() time.Duration {
+	return time.Duration(rand.Intn(151)+200) * time.Millisecond
+}
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
@@ -581,8 +622,8 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		randomize := time.Duration(2+rand.Intn(5)) * heartBeatInterval
-		time.Sleep(randomize)
+		randomize := randElectionTimeout()
+		time.Sleep(interval)
 
 		func() {
 			rf.mu.Lock()
@@ -596,8 +637,9 @@ func (rf *Raft) ticker() {
 				return
 			}
 
-			Debug(dInfo, "S%d %s start election, become Candidate", rf.me, rf.status)
+			Debug(dInfo, "%s start election, become Candidate", rf)
 			rf.becomeCandidate()
+			rf.persist()
 
 			last := rf.log.last()
 			args := RequestVoteArgs{
@@ -625,29 +667,32 @@ func (rf *Raft) handleRequestVote(i int, args *RequestVoteArgs, reply *RequestVo
 		defer rf.mu.Unlock()
 
 		if rf.killed() {
-			Debug(dDrop, "S%d %s is killed, drop RequestVote reply", rf.me, rf.status)
+			Debug(dDrop, "%s is killed, drop RequestVote reply", rf)
 			return
 		} else if reply.Term > rf.term {
-			Debug(dTerm, "S%d %s, sendRequestVote reply contain a new Term %d, become Follower",
-				rf.me, rf.status, reply.Term)
+			Debug(dTerm, "%s sendRequestVote reply contain a new Term %d, become Follower", rf, reply.Term)
 			rf.term = reply.Term
 			rf.becomeFollower()
-		} else if reply.Term != rf.term {
-			Debug(dDrop, "S%d %s, sendRequestVote reply contain a old Term %d, drop message",
-				rf.me, rf.status, reply.Term)
+			rf.persist()
+			return
+		} else if reply.Term < rf.term {
+			Debug(dDrop, "%s sendRequestVote reply contain a old Term %d, drop message", rf, reply.Term)
+			return
+		} else if rf.term != args.Term {
+			Debug(dDrop, "%s get a old sendRequestVote reply", rf)
 			return
 		}
 
-		if rf.status == Leader {
-			Debug(dDrop, "S%d %s is already Leader, ignore S%d sendRequestVote reply", rf.me, rf.status, i)
+		if rf.status != Candidate {
+			Debug(dDrop, "%s status change, not a Candidate, ignore S%d sendRequestVote reply", rf, i)
 			return
 		}
 
 		if reply.VoteGranted {
 			rf.progress.poll[i] = true
-			Debug(dVote, "S%d %s, S%d grant vote", rf.me, rf.status, i)
+			Debug(dVote, "%s S%d grant vote", rf, i)
 			if rf.progress.win() {
-				Debug(dLeader, "S%d %s collect majority vote, become Leader", rf.me, rf.status)
+				Debug(dLeader, "%s collect majority vote, become Leader", rf)
 				rf.becomeLeader()
 			}
 		}
@@ -661,7 +706,7 @@ func (rf *Raft) heartBeatIfIsLeader() {
 			defer rf.mu.Unlock()
 
 			if rf.status == Leader {
-				Debug(dLeader, "S%d %s begin send heartbeat to all peers", rf.me, rf.status)
+				Debug(dLeader, "%s begin send heartbeat to all peers", rf)
 				for i := range rf.peers {
 					if i == rf.me {
 						continue
@@ -680,8 +725,7 @@ func (rf *Raft) heartBeatIfIsLeader() {
 						LeaderCommit: rf.commitIndex,
 					}
 					reply := AppendEntriesReply{}
-					Debug(dInfo, "S%d %s sendAppendEntries to S%d, nextIndex is %d, entries length is %d",
-						rf.me, rf.status, i, next, len(entries))
+					Debug(dInfo, "%s sendAppendEntries to S%d, nextIndex is %d, entries length is %d", rf, i, next, len(entries))
 					go rf.handleAppendEntries(i, &args, &reply)
 				}
 			}
@@ -697,68 +741,66 @@ func (rf *Raft) handleAppendEntries(i int, args *AppendEntriesArgs, reply *Appen
 		defer rf.mu.Unlock()
 
 		if rf.killed() {
-			Debug(dDrop, "S%d %s is killed, drop sendAppendEntries reply", rf.me, rf.status)
+			Debug(dDrop, "%s is killed, drop sendAppendEntries reply", rf)
 			return
 		}
 
 		if reply.Term > rf.term {
-			Debug(dTerm, "S%d %s sendAppendEntries reply contain new Term %d, become Follower", rf.me, rf.status, reply.Term)
+			Debug(dTerm, "%s sendAppendEntries reply contain new Term %d, become Follower", rf, reply.Term)
 			rf.term = reply.Term
 			rf.becomeFollower()
-		} else if reply.Term != rf.term {
-			Debug(dDrop, "S%d %s sendAppendEntries reply contain old Term %d, current Term is %d, drop message", rf.me, rf.status, reply.Term, rf.term)
-			reply.Term = rf.term
-			reply.Success = false
+			rf.persist()
+			return
+		} else if reply.Term < rf.term {
+			Debug(dDrop, "%s sendAppendEntries reply contain old Term %d, current Term is %d, drop message", rf, reply.Term, rf.term)
+			return
+		} else if rf.term != args.Term {
+			Debug(dDrop, "%s get a old sendAppendEntries reply", rf)
 			return
 		}
 
 		if rf.status != Leader {
-			Debug(dLog2, "S%d %s is not Leader any more, ignore sendAppendEntries reply", rf.me, rf.status)
-			return
-		}
-
-		if rf.progress.nextIndex[i] != args.PrevLogIndex+1 {
-			Debug(dLog2, "S%d %s out of order sendAppendEntries reply, ignore")
+			Debug(dLog2, "%s not Leader any more, ignore sendAppendEntries reply", rf)
 			return
 		}
 
 		if !reply.Success {
-			if reply.XLen < args.PrevLogIndex+1 {
-				rf.progress.nextIndex[i] = reply.XLen
-				Debug(dLog, "S%d %s follower S%d log is too short, quick roll back to %d", rf.me, rf.status, i, rf.progress.nextIndex[i])
+			if reply.XTerm == None {
+				rf.progress.nextIndex[i] = reply.XIndex
+				Debug(dLog, "%s follower S%d log is too short, quick roll back to %d", rf, i, rf.progress.nextIndex[i])
 				return
 			}
 
 			entry := rf.log.get(reply.XIndex)
-			if entry.Term != reply.Term {
+			if entry.Term != reply.XTerm {
 				rf.progress.nextIndex[i] = reply.XIndex
-				Debug(dLog, "S%d %s doesn't have XTerm %d, quick roll back S%d nextIndex to %d", rf.me, rf.status, reply.Term, i, rf.progress.nextIndex[i])
+				Debug(dLog, "%s doesn't find Term %d, quick roll back S%d nextIndex to %d", rf, reply.XTerm, i, rf.progress.nextIndex[i])
 				return
 			}
-			rf.progress.nextIndex[i] = rf.log.lastIndexWithSameTerm(reply.XIndex)
-			Debug(dLog, "S%d %s contain XTerm %d, set S%d nextIndex to %d", rf.me, rf.status, entry.Term, i, rf.progress.nextIndex[i])
+			rf.progress.nextIndex[i] = rf.log.lastIndexWithSameTerm(reply.XIndex) + 1
+			Debug(dLog, "%s contain XTerm %d, set S%d nextIndex to %d", rf, reply.XTerm, i, rf.progress.nextIndex[i])
 			return
 		}
 
 		if len(args.Entries) == 0 {
-			Debug(dLog2, "S%d %s heartbeat reply, ignore", rf.me, rf.status)
+			Debug(dLog2, "%s heartbeat reply, ignore", rf)
 			return
 		}
 
 		rf.progress.nextIndex[i] = args.PrevLogIndex + len(args.Entries) + 1
 		rf.progress.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
-		Debug(dLog, "S%d %s sendAppendEntries reply success, set S%d nextIndex to %d, matchIndex to %d", rf.me, rf.status, i, rf.progress.nextIndex[i], rf.progress.matchIndex[i])
+		Debug(dLog, "%s sendAppendEntries reply success, set S%d nextIndex to %d, matchIndex to %d", rf, i, rf.progress.nextIndex[i], rf.progress.matchIndex[i])
 
 		commitIndex := rf.progress.commitIndex()
 		commitLog := rf.log.get(commitIndex)
 		if commitLog.Term != rf.term {
-			Debug(dCommit, "S%d %s %d commitIndex's Term is %d, current Term is %d, index will not commit", rf.me, rf.status, rf.commitIndex, commitLog.Term, rf.term)
+			Debug(dCommit, "%s commitIndex %d Term is %d, current Term is %d, index will not commit", rf, rf.commitIndex, commitLog.Term, rf.term)
 			return
 		}
 		if commitIndex > rf.lastApplied {
 			rf.commitIndex = commitIndex
 			rf.applyCond.Signal()
-			Debug(dCommit, "S%d %s update commitIndex to %d", rf.me, rf.status, rf.commitIndex)
+			Debug(dCommit, "%s update commitIndex to %d", rf, rf.commitIndex)
 		}
 	}
 }
@@ -767,7 +809,7 @@ func (rf *Raft) apply() {
 	rf.applyCond.L.Lock()
 	defer rf.applyCond.L.Unlock()
 	for rf.killed() == false {
-		if rf.commitIndex == rf.lastApplied {
+		if rf.commitIndex <= rf.lastApplied {
 			rf.applyCond.Wait()
 		}
 
@@ -780,7 +822,7 @@ func (rf *Raft) apply() {
 			}
 			rf.applyCh <- applyMsg
 			rf.lastApplied = i
-			Debug(dCommit, "S%d %s committed %d index log", rf.me, rf.status, i)
+			Debug(dCommit, "%s committed %d index log", rf, i)
 		}
 	}
 }
@@ -809,12 +851,15 @@ func (rf *Raft) becomeCandidate() {
 func (rf *Raft) becomeFollower() {
 	rf.status = Follower
 	rf.progress = nil
-	rf.knock = time.Now()
 }
 
 func (rf *Raft) becomeLeader() {
 	rf.status = Leader
 	rf.knock = time.Now()
+}
+
+func (rf *Raft) String() string {
+	return fmt.Sprintf("S%d %s %d", rf.me, rf.status, rf.term)
 }
 
 //
