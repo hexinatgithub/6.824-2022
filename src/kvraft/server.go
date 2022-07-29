@@ -1,28 +1,141 @@
 package kvraft
 
 import (
+	"fmt"
+	"log"
+	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
-	"log"
-	"sync"
-	"sync/atomic"
 )
 
-const Debug = false
+const debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
+	if debug {
 		log.Printf(format, a...)
 	}
 	return
 }
 
+// Retrieve the verbosity level from an environment variable
+func getVerbosity() int {
+	v := os.Getenv("VERBOSE")
+	level := 0
+	if v != "" {
+		var err error
+		level, err = strconv.Atoi(v)
+		if err != nil {
+			log.Fatalf("Invalid verbosity %v", v)
+		}
+	}
+	return level
+}
+
+type logTopic string
+
+const (
+	dGet       logTopic = "Get"
+	dPutAppend logTopic = "PutAppend"
+	dApply     logTopic = "Apply"
+)
+
+var debugStart time.Time
+var debugVerbosity int
+
+func init() {
+	debugVerbosity = getVerbosity()
+	debugStart = time.Now()
+
+	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
+}
+
+func Debug(topic logTopic, format string, a ...interface{}) {
+	if debug {
+		time := time.Since(debugStart).Microseconds()
+		time /= 100
+		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
+		format = prefix + format
+		log.Printf(format, a...)
+	}
+}
+
+type Action int
+
+const (
+	getAct Action = iota
+	putAct
+	appendAct
+)
+
+var (
+	ats = map[Action]string{
+		getAct:    "Get",
+		putAct:    "Put",
+		appendAct: "Append",
+	}
+	sta = map[string]Action{
+		"Get":    getAct,
+		"Put":    putAct,
+		"Append": appendAct,
+	}
+)
+
+func (act Action) String() string {
+	return ats[act]
+}
+
+func action(op string) Action {
+	return sta[op]
+}
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key    string
+	Value  string
+	Action Action
+
+	ClientId  int64
+	RequestId int64
+}
+
+func (o Op) String() string {
+	return fmt.Sprintf(`Op{Key: "%s", Value: "%s", Action: "%s", ClientId: %d, RequestId: %d}`,
+		o.Key, o.Value, o.Action, o.ClientId, o.RequestId)
+}
+
+type commitWait struct {
+	term   int
+	op     Op
+	result chan result
+}
+
+func (c commitWait) String() string {
+	return fmt.Sprintf(`commitWait{term: %d, op: %s}`, c.term, c.op)
+}
+
+type result struct {
+	err   Err
+	value string
+}
+
+func (r result) String() string {
+	if r.value == "" {
+		return fmt.Sprintf(`result{err: "%s"}`, r.err)
+	}
+	return fmt.Sprintf(`result{err: "%s", value: "%s"}`, r.err, r.value)
+}
+
+type track struct {
+	requestId int64
+	result    result
 }
 
 type KVServer struct {
@@ -35,15 +148,85 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-}
+	wait   map[int]commitWait
+	stopCh chan struct{}
 
+	state   map[string]string
+	session map[int64]track
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	op := Op{
+		Key:       args.Key,
+		Action:    getAct,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		Debug(dGet, "%s is not leader, %s is ignored", kv, args)
+		kv.mu.Unlock()
+		return
+	}
+	wait := commitWait{
+		term:   term,
+		op:     op,
+		result: make(chan result, 1),
+	}
+	kv.wait[index] = wait
+	kv.mu.Unlock()
+
+	Debug(dGet, "%s handle %s, start commit, wait for result", kv, args)
+	result := <-wait.result
+	reply.Value = result.value
+	reply.Err = result.err
+	Debug(dGet, "%s reply %s with %s", kv, args, result)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	op := Op{
+		Key:       args.Key,
+		Value:     args.Value,
+		Action:    action(args.Op),
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		Debug(dPutAppend, "%s is not leader, %s is ignored", kv, args)
+		kv.mu.Unlock()
+		return
+	}
+	wait := commitWait{
+		term:   term,
+		op:     op,
+		result: make(chan result, 1),
+	}
+	kv.wait[index] = wait
+	kv.mu.Unlock()
+
+	Debug(dPutAppend, "%s handle %s, start commit %d Log, wait for result", kv, args, index)
+	result := <-wait.result
+	reply.Err = result.err
+	Debug(dPutAppend, "%s reply %s with %s", kv, args, result)
 }
 
 //
@@ -60,11 +243,130 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+	close(kv.stopCh)
 }
 
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) apply() {
+	for {
+		select {
+		case applyMsg := <-kv.applyCh:
+			if applyMsg.CommandValid {
+				kv.applyCommand(&applyMsg)
+			} else {
+				kv.applySnapshot(&applyMsg)
+			}
+		case <-kv.stopCh:
+			return
+		}
+	}
+}
+
+func (kv *KVServer) gc() {
+	interval := time.Millisecond * 500
+	for {
+		select {
+		case <-time.After(interval):
+			func() {
+				kv.mu.Lock()
+				defer kv.mu.Unlock()
+				var di []int
+				term, _ := kv.rf.GetState()
+				res := result{err: ErrWrongLeader}
+				for i := range kv.wait {
+					if kv.wait[i].term != term {
+						kv.wait[i].result <- res
+						close(kv.wait[i].result)
+						di = append(di, i)
+					}
+				}
+				for i := range di {
+					delete(kv.wait, di[i])
+				}
+			}()
+		case <-kv.stopCh:
+			kv.mu.Lock()
+			for i := range kv.wait {
+				close(kv.wait[i].result)
+			}
+			kv.wait = nil
+			kv.mu.Unlock()
+			return
+		}
+	}
+}
+
+func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	op := applyMsg.Command.(Op)
+	wait, waitExist := kv.wait[applyMsg.CommandIndex]
+	trk, trkExist := kv.session[op.ClientId]
+
+	if trkExist && trk.requestId == op.RequestId {
+		if waitExist {
+			wait.result <- trk.result
+			Debug(dApply, "%s wait request is duplicated, send saved %s to %s", kv, trk.result, wait)
+			close(wait.result)
+			delete(kv.wait, applyMsg.CommandIndex)
+		} else {
+			Debug(dApply, "%s %s is duplicated", kv, op)
+		}
+		return
+	}
+
+	var res result
+	switch op.Action {
+	case getAct:
+		value, ok := kv.state[op.Key]
+		if ok {
+			res.err = OK
+			res.value = value
+		} else {
+			res.err = ErrNoKey
+		}
+	case putAct:
+		kv.state[op.Key] = op.Value
+		res.err = OK
+	case appendAct:
+		kv.state[op.Key] = kv.state[op.Key] + op.Value
+		res.err = OK
+	}
+	Debug(dApply, "%s apply %d Log %s", kv, applyMsg.CommandIndex, op)
+	kv.session[op.ClientId] = track{
+		requestId: op.RequestId,
+		result:    res,
+	}
+	Debug(dApply, "%s set client[%d] session's requestId to %d", kv, op.ClientId, op.RequestId)
+
+	term, _ := kv.rf.GetState()
+	if wait.op != op || wait.term != term {
+		res = result{err: ErrWrongLeader}
+		for i := range kv.wait {
+			kv.wait[i].result <- res
+			close(kv.wait[i].result)
+		}
+		Debug(dApply, "%s lose leadership before apply this Log, reply all wait request %s", kv, res.err)
+		kv.wait = make(map[int]commitWait)
+		return
+	}
+
+	if waitExist {
+		wait.result <- res
+		Debug(dApply, "%s send %s to %s", kv, res, wait)
+		close(wait.result)
+		delete(kv.wait, applyMsg.CommandIndex)
+	}
+}
+
+func (kv *KVServer) applySnapshot(applyMsg *raft.ApplyMsg) {}
+
+func (kv *KVServer) String() string {
+	return fmt.Sprintf("S%d", kv.me)
 }
 
 //
@@ -96,6 +398,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.wait = make(map[int]commitWait)
+	kv.stopCh = make(chan struct{})
+	kv.state = make(map[string]string)
+	kv.session = make(map[int64]track)
+	go kv.apply()
+	go kv.gc()
 
 	return kv
 }
