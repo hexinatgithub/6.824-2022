@@ -406,6 +406,9 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if index <= rf.log.LastIncludedIndex {
+		return
+	}
 	rf.log.trim(index - 1)
 	rf.lastApplied = max(rf.lastApplied, index-1)
 	rf.commitIndex = max(rf.commitIndex, index-1)
@@ -539,6 +542,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.knock = time.Now()
 
+	if args.PrevLogIndex < rf.log.LastIncludedIndex {
+		Debug(dLog2, "%s snapshot lastIncludedIndex %d is large than args's prevLogIndex %d", rf, rf.log.LastIncludedIndex, args.PrevLogIndex)
+		red := min(rf.log.LastIncludedIndex-args.PrevLogIndex, len(args.Entries))
+		args.PrevLogIndex = rf.log.LastIncludedIndex
+		args.PrevLogTerm = rf.log.LastIncludedTerm
+		args.Entries = args.Entries[red:]
+		Debug(dLog2, "%s delete %d args's head entries, set args's prevLogIndex to %d", rf, red)
+		return
+	}
+
 	entry := rf.log.get(args.PrevLogIndex)
 	last := rf.log.last()
 
@@ -612,14 +625,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		Debug(dDrop, "%s Leader S%d InstallSnapshot's Term %d is old, current Term is %d, drop snapshot", rf, args.LeaderId, args.Term, rf.term)
 		return
 	}
+	if rf.status != Follower {
+		Debug(dInfo, "%s become Follower", rf)
+		rf.becomeFollower()
+	}
+
 	if args.LastIncludedIndex <= rf.log.LastIncludedIndex {
 		reply.Term = rf.term
 		Debug(dDrop, "%s Leader S%d InstallSnapshot's snapshot is old, args's LastIncludedIndex is %d, current LastIncludedIndex is %d, drop", rf, args.LeaderId, args.LastIncludedIndex, rf.log.LastIncludedIndex)
 		return
-	}
-	if rf.status != Follower {
-		Debug(dInfo, "%s become Follower", rf)
-		rf.becomeFollower()
 	}
 
 	rf.knock = time.Now()

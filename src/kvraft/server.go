@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -43,6 +44,8 @@ const (
 	dGet       logTopic = "Get"
 	dPutAppend logTopic = "PutAppend"
 	dApply     logTopic = "Apply"
+	dSnap      logTopic = "Snap"
+	dRestore   logTopic = "Restore"
 )
 
 var debugStart time.Time
@@ -114,28 +117,28 @@ func (o Op) String() string {
 type commitWait struct {
 	term   int
 	op     Op
-	result chan result
+	result chan Result
 }
 
 func (c commitWait) String() string {
 	return fmt.Sprintf(`commitWait{term: %d, op: %s}`, c.term, c.op)
 }
 
-type result struct {
-	err   Err
-	value string
+type Result struct {
+	Err   Err
+	Value string
 }
 
-func (r result) String() string {
-	if r.value == "" {
-		return fmt.Sprintf(`result{err: "%s"}`, r.err)
+func (r Result) String() string {
+	if r.Value == "" {
+		return fmt.Sprintf(`result{Err: "%s"}`, r.Err)
 	}
-	return fmt.Sprintf(`result{err: "%s", value: "%s"}`, r.err, r.value)
+	return fmt.Sprintf(`result{Err: "%s", Value: "%s"}`, r.Err, r.Value)
 }
 
-type track struct {
-	requestId int64
-	result    result
+type Track struct {
+	RequestId int64
+	Result    Result
 }
 
 type KVServer struct {
@@ -148,11 +151,13 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	wait   map[int]commitWait
-	stopCh chan struct{}
+	persister *raft.Persister
+	wait      map[int]commitWait
+	stopCh    chan struct{}
 
-	state   map[string]string
-	session map[int64]track
+	state       map[string]string
+	session     map[int64]Track
+	lastApplied int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -180,15 +185,16 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	wait := commitWait{
 		term:   term,
 		op:     op,
-		result: make(chan result, 1),
+		result: make(chan Result, 1),
 	}
 	kv.wait[index] = wait
+	kv.trySnap()
 	kv.mu.Unlock()
 
 	Debug(dGet, "%s handle %s, start commit, wait for result", kv, args)
 	result := <-wait.result
-	reply.Value = result.value
-	reply.Err = result.err
+	reply.Value = result.Value
+	reply.Err = result.Err
 	Debug(dGet, "%s reply %s with %s", kv, args, result)
 }
 
@@ -218,14 +224,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	wait := commitWait{
 		term:   term,
 		op:     op,
-		result: make(chan result, 1),
+		result: make(chan Result, 1),
 	}
 	kv.wait[index] = wait
+	kv.trySnap()
 	kv.mu.Unlock()
 
 	Debug(dPutAppend, "%s handle %s, start commit %d Log, wait for result", kv, args, index)
 	result := <-wait.result
-	reply.Err = result.err
+	reply.Err = result.Err
 	Debug(dPutAppend, "%s reply %s with %s", kv, args, result)
 }
 
@@ -276,7 +283,7 @@ func (kv *KVServer) gc() {
 				defer kv.mu.Unlock()
 				var di []int
 				term, _ := kv.rf.GetState()
-				res := result{err: ErrWrongLeader}
+				res := Result{Err: ErrWrongLeader}
 				for i := range kv.wait {
 					if kv.wait[i].term != term {
 						kv.wait[i].result <- res
@@ -287,6 +294,7 @@ func (kv *KVServer) gc() {
 				for i := range di {
 					delete(kv.wait, di[i])
 				}
+				kv.trySnap()
 			}()
 		case <-kv.stopCh:
 			kv.mu.Lock()
@@ -303,14 +311,18 @@ func (kv *KVServer) gc() {
 func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	if applyMsg.CommandIndex <= kv.lastApplied {
+		return
+	}
+
 	op := applyMsg.Command.(Op)
 	wait, waitExist := kv.wait[applyMsg.CommandIndex]
 	trk, trkExist := kv.session[op.ClientId]
 
-	if trkExist && trk.requestId == op.RequestId {
+	if trkExist && trk.RequestId == op.RequestId {
 		if waitExist {
-			wait.result <- trk.result
-			Debug(dApply, "%s wait request is duplicated, send saved %s to %s", kv, trk.result, wait)
+			wait.result <- trk.Result
+			Debug(dApply, "%s wait request is duplicate, send saved %s to %s", kv, trk.Result, wait)
 			close(wait.result)
 			delete(kv.wait, applyMsg.CommandIndex)
 		} else {
@@ -319,51 +331,97 @@ func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg) {
 		return
 	}
 
-	var res result
+	var res Result
 	switch op.Action {
 	case getAct:
 		value, ok := kv.state[op.Key]
 		if ok {
-			res.err = OK
-			res.value = value
+			res.Err = OK
+			res.Value = value
 		} else {
-			res.err = ErrNoKey
+			res.Err = ErrNoKey
 		}
 	case putAct:
 		kv.state[op.Key] = op.Value
-		res.err = OK
+		res.Err = OK
 	case appendAct:
 		kv.state[op.Key] = kv.state[op.Key] + op.Value
-		res.err = OK
+		res.Err = OK
 	}
+	kv.lastApplied = applyMsg.CommandIndex
 	Debug(dApply, "%s apply %d Log %s", kv, applyMsg.CommandIndex, op)
-	kv.session[op.ClientId] = track{
-		requestId: op.RequestId,
-		result:    res,
+	kv.session[op.ClientId] = Track{
+		RequestId: op.RequestId,
+		Result:    res,
 	}
 	Debug(dApply, "%s set client[%d] session's requestId to %d", kv, op.ClientId, op.RequestId)
+	kv.trySnap()
 
 	term, _ := kv.rf.GetState()
 	if wait.op != op || wait.term != term {
-		res = result{err: ErrWrongLeader}
+		res = Result{Err: ErrWrongLeader}
 		for i := range kv.wait {
 			kv.wait[i].result <- res
 			close(kv.wait[i].result)
 		}
-		Debug(dApply, "%s lose leadership before apply this Log, reply all wait request %s", kv, res.err)
+		Debug(dApply, "%s lose leadership before apply this Log, reply all wait request %s", kv, res.Err)
 		kv.wait = make(map[int]commitWait)
 		return
-	}
-
-	if waitExist {
-		wait.result <- res
-		Debug(dApply, "%s send %s to %s", kv, res, wait)
-		close(wait.result)
-		delete(kv.wait, applyMsg.CommandIndex)
+	} else {
+		if waitExist {
+			wait.result <- res
+			Debug(dApply, "%s send %s to %s", kv, res, wait)
+			close(wait.result)
+			delete(kv.wait, applyMsg.CommandIndex)
+		}
 	}
 }
 
-func (kv *KVServer) applySnapshot(applyMsg *raft.ApplyMsg) {}
+func (kv *KVServer) applySnapshot(applyMsg *raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if applyMsg.SnapshotIndex <= kv.lastApplied {
+		return
+	}
+	kv.restore(applyMsg.Snapshot)
+	Debug(dSnap, "%s apply snapshot at %d", kv, kv.lastApplied)
+}
+
+func (kv *KVServer) trySnap() {
+	if kv.maxraftstate != -1 {
+		left := kv.maxraftstate - kv.persister.RaftStateSize()
+		ther := int(float64(kv.maxraftstate) * 0.1)
+		if left <= ther {
+			kv.snapshot()
+		}
+	}
+}
+
+func (kv *KVServer) snapshot() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.state)
+	e.Encode(kv.session)
+	e.Encode(kv.lastApplied)
+	data := w.Bytes()
+	kv.rf.Snapshot(kv.lastApplied, data)
+	Debug(dSnap, "%s take a snapshot at %d", kv, kv.lastApplied)
+}
+
+func (kv *KVServer) restore(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&kv.state) != nil ||
+		d.Decode(&kv.session) != nil ||
+		d.Decode(&kv.lastApplied) != nil {
+		panic("readPersist")
+	}
+	Debug(dRestore, "%s restore from image, lastApplied %d", kv, kv.lastApplied)
+}
 
 func (kv *KVServer) String() string {
 	return fmt.Sprintf("S%d", kv.me)
@@ -398,10 +456,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.persister = persister
 	kv.wait = make(map[int]commitWait)
 	kv.stopCh = make(chan struct{})
 	kv.state = make(map[string]string)
-	kv.session = make(map[int64]track)
+	kv.session = make(map[int64]Track)
+	kv.restore(persister.ReadSnapshot())
 	go kv.apply()
 	go kv.gc()
 
