@@ -1,5 +1,7 @@
 package shardctrler
 
+import "fmt"
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -28,14 +30,56 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (c Config) String() string {
+	return fmt.Sprintf("Config{Num: %d, Shards: %v, Groups: %v}", c.Num, c.Shards, c.Groups)
+}
+
+type Args interface {
+	Equal(o Args) bool
+	String() string
+}
+
 const (
-	OK = "OK"
+	OK             = "OK"
+	ErrWrongLeader = "ErrWrongLeader"
+	ErrUnknownOp   = "ErrUnknownOperation"
 )
 
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers   map[int][]string // new GID -> servers mappings
+	ClientId  int64
+	RequestId int64
+}
+
+func (a JoinArgs) Equal(o Args) bool {
+	b, ok := o.(JoinArgs)
+	if !ok {
+		return false
+	}
+	if len(a.Servers) != len(b.Servers) {
+		return false
+	}
+	for gid, aservers := range a.Servers {
+		if bservers, ok := b.Servers[gid]; !ok {
+			return false
+		} else {
+			if len(aservers) != len(bservers) {
+				return false
+			}
+			for i := range aservers {
+				if aservers[i] != bservers[i] {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func (a JoinArgs) String() string {
+	return fmt.Sprintf("JoinArgs{Servers: %v, ClientId: %d, RequestId: %d}", a.Servers, a.ClientId, a.RequestId)
 }
 
 type JoinReply struct {
@@ -44,7 +88,32 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs      []int
+	ClientId  int64
+	RequestId int64
+}
+
+func (a LeaveArgs) Equal(o Args) bool {
+	b, ok := o.(LeaveArgs)
+	if !ok {
+		return false
+	}
+	if a.ClientId != b.ClientId || a.RequestId != b.RequestId {
+		return false
+	}
+	if len(a.GIDs) != len(b.GIDs) {
+		return false
+	}
+	for i := range a.GIDs {
+		if a.GIDs[i] != b.GIDs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (a LeaveArgs) String() string {
+	return fmt.Sprintf("LeaveArgs{GIDs: %v, ClientId: %d, RequestId: %d}", a.GIDs, a.ClientId, a.RequestId)
 }
 
 type LeaveReply struct {
@@ -53,8 +122,22 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard     int
+	GID       int
+	ClientId  int64
+	RequestId int64
+}
+
+func (a MoveArgs) Equal(o Args) bool {
+	b, ok := o.(MoveArgs)
+	if !ok {
+		return false
+	}
+	return a == b
+}
+
+func (a MoveArgs) String() string {
+	return fmt.Sprintf("MoveArgs{Shard: %d, GID: %d, ClientId: %d, RequestId: %d}", a.Shard, a.GID, a.ClientId, a.RequestId)
 }
 
 type MoveReply struct {
@@ -63,7 +146,21 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num       int // desired config number
+	ClientId  int64
+	RequestId int64
+}
+
+func (a QueryArgs) Equal(o Args) bool {
+	b, ok := o.(QueryArgs)
+	if !ok {
+		return false
+	}
+	return a == b
+}
+
+func (a QueryArgs) String() string {
+	return fmt.Sprintf("QueryArgs{Num: %d, ClientId: %d, RequestId: %d}", a.Num, a.ClientId, a.RequestId)
 }
 
 type QueryReply struct {

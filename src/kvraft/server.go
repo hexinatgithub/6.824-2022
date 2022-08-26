@@ -71,21 +71,21 @@ func Debug(topic logTopic, format string, a ...interface{}) {
 type Action int
 
 const (
-	getAct Action = iota
-	putAct
-	appendAct
+	ActGet Action = iota
+	ActPut
+	ActAppend
 )
 
 var (
 	ats = map[Action]string{
-		getAct:    "Get",
-		putAct:    "Put",
-		appendAct: "Append",
+		ActGet:    "Get",
+		ActPut:    "Put",
+		ActAppend: "Append",
 	}
 	sta = map[string]Action{
-		"Get":    getAct,
-		"Put":    putAct,
-		"Append": appendAct,
+		"Get":    ActGet,
+		"Put":    ActPut,
+		"Append": ActAppend,
 	}
 )
 
@@ -171,7 +171,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	op := Op{
 		Key:       args.Key,
-		Action:    getAct,
+		Action:    ActGet,
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
@@ -316,11 +316,11 @@ func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg) {
 	}
 
 	op := applyMsg.Command.(Op)
-	wait, waitExist := kv.wait[applyMsg.CommandIndex]
-	trk, trkExist := kv.session[op.ClientId]
+	wait, waitOk := kv.wait[applyMsg.CommandIndex]
+	trk, trkOk := kv.session[op.ClientId]
 
-	if trkExist && trk.RequestId == op.RequestId {
-		if waitExist {
+	if trkOk && trk.RequestId == op.RequestId {
+		if waitOk {
 			wait.result <- trk.Result
 			Debug(dApply, "%s wait request is duplicate, send saved %s to %s", kv, trk.Result, wait)
 			close(wait.result)
@@ -333,7 +333,7 @@ func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg) {
 
 	var res Result
 	switch op.Action {
-	case getAct:
+	case ActGet:
 		value, ok := kv.state[op.Key]
 		if ok {
 			res.Err = OK
@@ -341,10 +341,10 @@ func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg) {
 		} else {
 			res.Err = ErrNoKey
 		}
-	case putAct:
+	case ActPut:
 		kv.state[op.Key] = op.Value
 		res.Err = OK
-	case appendAct:
+	case ActAppend:
 		kv.state[op.Key] = kv.state[op.Key] + op.Value
 		res.Err = OK
 	}
@@ -355,10 +355,10 @@ func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg) {
 		Result:    res,
 	}
 	Debug(dApply, "%s set client[%d] session's requestId to %d", kv, op.ClientId, op.RequestId)
-	kv.trySnap()
 
-	term, _ := kv.rf.GetState()
-	if wait.op != op || wait.term != term {
+	if !waitOk {
+		// do nothing
+	} else if term, _ := kv.rf.GetState(); wait.op != op || wait.term != term {
 		res = Result{Err: ErrWrongLeader}
 		for i := range kv.wait {
 			kv.wait[i].result <- res
@@ -366,15 +366,15 @@ func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg) {
 		}
 		Debug(dApply, "%s lose leadership before apply this Log, reply all wait request %s", kv, res.Err)
 		kv.wait = make(map[int]commitWait)
-		return
 	} else {
-		if waitExist {
+		if waitOk {
 			wait.result <- res
 			Debug(dApply, "%s send %s to %s", kv, res, wait)
 			close(wait.result)
 			delete(kv.wait, applyMsg.CommandIndex)
 		}
 	}
+	kv.trySnap()
 }
 
 func (kv *KVServer) applySnapshot(applyMsg *raft.ApplyMsg) {
