@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"6.824/labgob"
@@ -82,6 +83,7 @@ type ShardCtrler struct {
 	persister *raft.Persister
 	wait      map[int]commitWait
 	stopCh    chan struct{}
+	killed    int32
 
 	configs     []Config // indexed by config num
 	session     map[int64]Track
@@ -137,7 +139,7 @@ func (op Op) String() string {
 type Result struct {
 	WrongLeader bool
 	Err         Err
-	Config      *Config
+	Config      Config
 }
 
 func (r Result) String() string {
@@ -241,7 +243,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	reply.Err = result.Err
 	reply.WrongLeader = result.WrongLeader
 	if !result.WrongLeader {
-		reply.Config = *result.Config
+		reply.Config = result.Config
 	}
 	Debug(dJoin, "%s proccess %s complete", sc, op)
 }
@@ -249,6 +251,11 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 func (sc *ShardCtrler) commit(op Op) (*commitWait, bool) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+
+	if sc.Killed() {
+		return nil, true
+	}
+
 	index, term, isLeader := sc.rf.Start(op)
 	if !isLeader {
 		Debug(dJoin, "%s is not a Leader", sc)
@@ -271,7 +278,13 @@ func (sc *ShardCtrler) commit(op Op) (*commitWait, bool) {
 func (sc *ShardCtrler) Kill() {
 	sc.rf.Kill()
 	// Your code here, if desired.
+	atomic.StoreInt32(&sc.killed, 1)
 	close(sc.stopCh)
+}
+
+func (sc *ShardCtrler) Killed() bool {
+	z := atomic.LoadInt32(&sc.killed)
+	return z == 1
 }
 
 // needed by shardkv tester
@@ -394,9 +407,14 @@ func loadBalance(conf *Config) {
 
 func (sc *ShardCtrler) reshard(c *Config) {
 	loadBalance(c)
-	c.Num = c.Num + 1
+	Debug(dShard, "%s reshard servers", sc)
+	sc.appendConfig(c)
+}
+
+func (sc *ShardCtrler) appendConfig(c *Config) {
+	c.Num = sc.configs[len(sc.configs)-1].Num + 1
 	sc.configs = append(sc.configs, *c)
-	Debug(dShard, "%s reshard servers, new config is %s", sc, c)
+	Debug(dShard, "%s append new config: %s", sc, c)
 }
 
 type configWrapper struct {
@@ -425,14 +443,9 @@ func (w *configWrapper) result() *Config {
 
 // deep copy config and return a configWrapper
 func wrapper(conf *Config) *configWrapper {
-	a := new(configWrapper)
-	a.config.Num = conf.Num
-	a.config.Shards = conf.Shards
-	a.config.Groups = map[int][]string{}
-	for gid, servers := range conf.Groups {
-		a.config.Groups[gid] = append(a.config.Groups[gid], servers...)
+	return &configWrapper{
+		config: conf.DeepCopy(),
 	}
-	return a
 }
 
 func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg) {
@@ -442,7 +455,6 @@ func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg) {
 		return
 	}
 
-	var wp *configWrapper
 	op := applyMsg.Command.(Op)
 	wait, waitOk := sc.wait[applyMsg.CommandIndex]
 	trk, trkOk := sc.session[op.ClientId]
@@ -460,50 +472,29 @@ func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg) {
 	}
 
 	var res Result
-	switch op.Action {
-	case ActJoin:
-		args, ok := op.Args.(JoinArgs)
-		if !ok {
-			Debug(dJoin, "%s operation is invalid: %v", sc, op)
-			return
-		}
-		wp = sc.getConfigWrapper(-1)
+	switch args := op.Args.(type) {
+	case JoinArgs:
+		wp := sc.getConfigWrapper(-1)
 		wp.join(args.Servers)
-		res.WrongLeader = false
-		res.Err = OK
-	case ActLeave:
-		args, ok := op.Args.(LeaveArgs)
-		if !ok {
-			Debug(dLeave, "%s operation is invalid: %v", sc, op)
-			return
-		}
-		wp = sc.getConfigWrapper(-1)
-		wp.leave(args.GIDs)
-		res.WrongLeader = false
-		res.Err = OK
-	case ActMove:
-		args, ok := op.Args.(MoveArgs)
-		if !ok {
-			Debug(dMove, "%s operation is invalid: %v", sc, op)
-			return
-		}
-		wp = sc.getConfigWrapper(-1)
-		wp.move(args.Shard, args.GID)
-		res.WrongLeader = false
-		res.Err = OK
-	case ActQuery:
-		args, ok := op.Args.(QueryArgs)
-		if !ok {
-			Debug(dQuery, "%s operation is invalid: %v", sc, op)
-			return
-		}
-		res.WrongLeader = false
-		res.Err = OK
-		res.Config = sc.getConfig(args.Num)
-	}
-
-	if wp != nil {
 		sc.reshard(wp.result())
+		res.WrongLeader = false
+		res.Err = OK
+	case LeaveArgs:
+		wp := sc.getConfigWrapper(-1)
+		wp.leave(args.GIDs)
+		sc.reshard(wp.result())
+		res.WrongLeader = false
+		res.Err = OK
+	case MoveArgs:
+		wp := sc.getConfigWrapper(-1)
+		wp.move(args.Shard, args.GID)
+		sc.appendConfig(wp.result())
+		res.WrongLeader = false
+		res.Err = OK
+	case QueryArgs:
+		res.WrongLeader = false
+		res.Err = OK
+		res.Config = sc.getConfig(args.Num).DeepCopy()
 	}
 
 	sc.lastApplied = applyMsg.CommandIndex
@@ -525,12 +516,10 @@ func (sc *ShardCtrler) applyCommand(applyMsg *raft.ApplyMsg) {
 		Debug(dApply, "%s lose leadership before apply this Log, reply all wait request %s", sc, res.Err)
 		sc.wait = make(map[int]commitWait)
 	} else {
-		if waitOk {
-			wait.result <- res
-			Debug(dApply, "%s send %s to %s", sc, res, wait)
-			close(wait.result)
-			delete(sc.wait, applyMsg.CommandIndex)
-		}
+		wait.result <- res
+		Debug(dApply, "%s send %s to %s", sc, res, wait)
+		close(wait.result)
+		delete(sc.wait, applyMsg.CommandIndex)
 	}
 	sc.trySnap()
 }
@@ -584,7 +573,7 @@ func (sc *ShardCtrler) gc() {
 			for i := range sc.wait {
 				close(sc.wait[i].result)
 			}
-			sc.wait = nil
+			sc.wait = make(map[int]commitWait)
 			sc.mu.Unlock()
 			return
 		}

@@ -115,6 +115,7 @@ func (o Op) String() string {
 }
 
 type commitWait struct {
+	index  int
 	term   int
 	op     Op
 	result chan Result
@@ -162,36 +163,20 @@ type KVServer struct {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	kv.mu.Lock()
-	if kv.killed() {
-		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
-		return
-	}
-
 	op := Op{
 		Key:       args.Key,
 		Action:    ActGet,
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	index, term, isLeader := kv.rf.Start(op)
-	if !isLeader {
+	wait, wrongLeader := kv.commitOp(op)
+	if wrongLeader {
 		reply.Err = ErrWrongLeader
 		Debug(dGet, "%s is not leader, %s is ignored", kv, args)
-		kv.mu.Unlock()
 		return
 	}
-	wait := commitWait{
-		term:   term,
-		op:     op,
-		result: make(chan Result, 1),
-	}
-	kv.wait[index] = wait
-	kv.trySnap()
-	kv.mu.Unlock()
 
-	Debug(dGet, "%s handle %s, start commit, wait for result", kv, args)
+	Debug(dGet, "%s handle %s, start commit %d Log, wait for result", kv, args, wait.index)
 	result := <-wait.result
 	reply.Value = result.Value
 	reply.Err = result.Err
@@ -200,13 +185,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	kv.mu.Lock()
-	if kv.killed() {
-		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
-		return
-	}
-
 	op := Op{
 		Key:       args.Key,
 		Value:     args.Value,
@@ -214,29 +192,42 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	index, term, isLeader := kv.rf.Start(op)
-	if !isLeader {
+	wait, wrongLeader := kv.commitOp(op)
+	if wrongLeader {
 		reply.Err = ErrWrongLeader
 		Debug(dPutAppend, "%s is not leader, %s is ignored", kv, args)
-		kv.mu.Unlock()
 		return
 	}
+
+	Debug(dPutAppend, "%s handle %s, start commit %d Log, wait for result", kv, args, wait.index)
+	result := <-wait.result
+	reply.Err = result.Err
+	Debug(dPutAppend, "%s reply %s with %s", kv, args, result)
+}
+
+func (kv *KVServer) commitOp(op Op) (*commitWait, bool) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if kv.killed() {
+		return nil, true
+	}
+
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return nil, true
+	}
 	wait := commitWait{
+		index:  index,
 		term:   term,
 		op:     op,
 		result: make(chan Result, 1),
 	}
 	kv.wait[index] = wait
 	kv.trySnap()
-	kv.mu.Unlock()
-
-	Debug(dPutAppend, "%s handle %s, start commit %d Log, wait for result", kv, args, index)
-	result := <-wait.result
-	reply.Err = result.Err
-	Debug(dPutAppend, "%s reply %s with %s", kv, args, result)
+	return &wait, false
 }
 
-//
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -245,7 +236,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // code to Kill(). you're not required to do anything
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
-//
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
@@ -311,10 +301,6 @@ func (kv *KVServer) gc() {
 func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if applyMsg.CommandIndex <= kv.lastApplied {
-		return
-	}
-
 	op := applyMsg.Command.(Op)
 	wait, waitOk := kv.wait[applyMsg.CommandIndex]
 	trk, trkOk := kv.session[op.ClientId]
@@ -367,12 +353,10 @@ func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg) {
 		Debug(dApply, "%s lose leadership before apply this Log, reply all wait request %s", kv, res.Err)
 		kv.wait = make(map[int]commitWait)
 	} else {
-		if waitOk {
-			wait.result <- res
-			Debug(dApply, "%s send %s to %s", kv, res, wait)
-			close(wait.result)
-			delete(kv.wait, applyMsg.CommandIndex)
-		}
+		wait.result <- res
+		Debug(dApply, "%s send %s to %s", kv, res, wait)
+		close(wait.result)
+		delete(kv.wait, applyMsg.CommandIndex)
 	}
 	kv.trySnap()
 }
@@ -380,9 +364,6 @@ func (kv *KVServer) applyCommand(applyMsg *raft.ApplyMsg) {
 func (kv *KVServer) applySnapshot(applyMsg *raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if applyMsg.SnapshotIndex <= kv.lastApplied {
-		return
-	}
 	kv.restore(applyMsg.Snapshot)
 	Debug(dSnap, "%s apply snapshot at %d", kv, kv.lastApplied)
 }
@@ -390,8 +371,8 @@ func (kv *KVServer) applySnapshot(applyMsg *raft.ApplyMsg) {
 func (kv *KVServer) trySnap() {
 	if kv.maxraftstate != -1 {
 		left := kv.maxraftstate - kv.persister.RaftStateSize()
-		ther := int(float64(kv.maxraftstate) * 0.1)
-		if left <= ther {
+		thre := int(float64(kv.maxraftstate) * 0.1)
+		if left <= thre {
 			kv.snapshot()
 		}
 	}
@@ -427,7 +408,6 @@ func (kv *KVServer) String() string {
 	return fmt.Sprintf("S%d", kv.me)
 }
 
-//
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -440,7 +420,6 @@ func (kv *KVServer) String() string {
 // you don't need to snapshot.
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
-//
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.

@@ -34,6 +34,20 @@ func (c Config) String() string {
 	return fmt.Sprintf("Config{Num: %d, Shards: %v, Groups: %v}", c.Num, c.Shards, c.Groups)
 }
 
+func (c Config) DeepCopy() Config {
+	config := Config{
+		Num:    c.Num,
+		Shards: c.Shards,
+		Groups: make(map[int][]string),
+	}
+	for k := range c.Groups {
+		servers := make([]string, 0, len(c.Groups[k]))
+		servers = append(servers, c.Groups[k]...)
+		config.Groups[k] = servers
+	}
+	return config
+}
+
 type Args interface {
 	Equal(o Args) bool
 	String() string
